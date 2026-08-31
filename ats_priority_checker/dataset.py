@@ -7,9 +7,34 @@ from pathlib import Path
 import pandas as pd
 
 from .extract import DEFAULT_STYLE_THRESHOLD, classify_style_by_text, process_pdf
-from .graph_signals import spectrum_priority_hint
+from .graph_signals import detect_measurement_point
 
 REC_SEP = " | "
+
+# Columns a removed feature used to write into dataset.csv. build_dataset
+# never produces these (they're not ReportRecord fields, and nothing adds
+# them post-hoc anymore either), so a fresh build is naturally clean - but
+# recompute_dataset reads an EXISTING dataset.csv off disk and only
+# updates the specific columns it knows how to re-derive (style,
+# measurement_point), leaving everything else exactly as found. Without
+# this, a dataset.csv built before a feature was removed would keep
+# showing that feature's stale columns (with stale values!) forever,
+# through every future recompute_dataset call, since nothing ever tells it
+# to drop them. Confirmed on real data: escalation_flag/escalation_reason/
+# escalation_priority_hint/prior_date_tested/prior_spectrum_peak_amplitude/
+# prior_spectrum_priority_hint/escalation_trigger kept showing up (with
+# real-looking but no-longer-produced values) well after
+# add_escalation_signals itself was deleted. Add to this list, don't just
+# delete the column-producing code, next time a column gets retired.
+_LEGACY_COLUMNS_TO_DROP = [
+    "prior_date_tested",
+    "prior_spectrum_peak_amplitude",
+    "prior_spectrum_priority_hint",
+    "escalation_flag",
+    "escalation_reason",
+    "escalation_trigger",
+    "escalation_priority_hint",
+]
 
 
 def _split_and_write(df: pd.DataFrame, out_dir: Path, filter_style: bool) -> dict:
@@ -23,6 +48,7 @@ def _split_and_write(df: pd.DataFrame, out_dir: Path, filter_style: bool) -> dic
     # row below. Always force a real bool dtype before masking with it.
     df = df.copy()
     df["parse_ok"] = df["parse_ok"].astype(bool)
+    df = df.drop(columns=[c for c in _LEGACY_COLUMNS_TO_DROP if c in df.columns])
 
     if filter_style:
         usable = df[(df["style"] == "waterfall") & (df["parse_ok"])].copy()
@@ -64,12 +90,15 @@ def build_dataset(
     - parse_errors.csv    rows that failed to parse cleanly, for regex fixes /
                           manual review
 
-    This is the slow step (OCR runs on every PDF's chart image). Every row
-    also carries chart_ocr_text - the raw OCR output cached alongside it -
-    specifically so that a later change to style/Fund Amp/unit *logic*
-    doesn't require re-running this against every PDF again: use
-    recompute_dataset() instead, which re-derives those fields from the
-    cached text in seconds instead of however long OCR-ing everything took.
+    This is the slow step (OCR + pixel analysis run on every PDF's chart
+    image). Every row also carries chart_ocr_text - the raw OCR output
+    cached alongside it - specifically so that a later change to style
+    detection *logic* doesn't require re-running this against every PDF
+    again: use recompute_dataset() instead. See recompute_dataset's
+    docstring for exactly what it can and can't refresh from the cache -
+    the Spectrum peak reading itself needs the actual chart image (pixel
+    analysis), unlike the old Fund Amp text field, so it's not one of the
+    things a cache-only recompute can redo.
 
     Pass max_pages=1 to only extract each PDF's first page and ignore any
     additional pages entirely.
@@ -116,11 +145,11 @@ def build_dataset(
                     "chart_colorfulness": None,
                     "style": "unknown",
                     "spectrum_unit": None,
-                    "spectrum_fund_amp": None,
+                    "measurement_point": None,
+                    "spectrum_peak_amplitude": None,
+                    "spectrum_peak_amplitude_raw": None,
                     "spectrum_priority_hint": None,
-                    "trend_current_value": None,
-                    "trend_escalation": None,
-                    "trend_priority_hint": None,
+                    "spectrum_peak_error": None,
                     "chart_ocr_text": None,
                     "parse_ok": False,
                     "parse_notes": f"exception during processing: {exc}",
@@ -141,27 +170,31 @@ def build_dataset(
 
 
 def recompute_dataset(out_dir: str | Path, filter_style: bool = True) -> dict:
-    """Re-derive style/spectrum_unit/spectrum_fund_amp/spectrum_priority_hint
-    from the chart_ocr_text already cached in out_dir's CSVs, and re-split/
-    rewrite dataset.csv, excluded_style.csv, and parse_errors.csv.
+    """Re-derive `style` and `measurement_point` from the chart_ocr_text
+    already cached in out_dir's CSVs, and re-split/rewrite dataset.csv,
+    excluded_style.csv, and parse_errors.csv.
 
-    Use this after changing classify_style_by_text() or
-    spectrum_priority_hint()'s logic - it does NOT open any PDFs or run OCR
-    again, so it finishes in seconds regardless of how many reports you
-    have, unlike build_dataset(). It can't recover rows whose
-    chart_ocr_text is missing (no chart image was found, or OCR itself
-    failed on that page) - those keep whatever style/spectrum_* values
-    they already had, since there's no cached text to re-derive from.
+    What this CAN refresh without opening any PDFs or re-running OCR/pixel
+    analysis (finishes in seconds regardless of how many reports you have):
+      - style, from cached chart_ocr_text - use after changing
+        classify_style_by_text()
+      - measurement_point, from cached chart_ocr_text - use after changing
+        graph_signals.detect_measurement_point() (older CSVs without this
+        column just get it filled in for the first time)
 
-    Does NOT touch trend_current_value/trend_escalation/trend_priority_hint
-    - unlike the Spectrum/style signals, trend_priority_hint() needs the
-    actual chart image (pixel analysis for the escalation check), not just
-    the cached OCR text, so a change to Trend logic still needs a full
-    build_dataset() re-run to take effect.
+    What this CANNOT refresh (needs a full build_dataset() re-run):
+      - spectrum_peak_amplitude / spectrum_priority_hint themselves. Unlike
+        the old Fund Amp text field, the Spectrum peak is read from the
+        chart image's PIXELS (see graph_signals.read_spectrum_peak) - the
+        cached chart_ocr_text alone isn't enough to redo that, since only
+        the unit comes from OCR text; the amplitude comes from the image.
+        A change to the peak-reading heuristics (graph_signals.py's
+        _find_peak_pixel etc.) or to the in/s, gE, g threshold functions
+        always needs the slow path.
 
     Only run this against an out_dir that build_dataset has already
     populated (i.e. after at least one full run with a version of the code
-    that saves chart_ocr_text).
+    that saves chart_ocr_text and spectrum_peak_amplitude).
     """
     out_dir = Path(out_dir)
     parts = []
@@ -187,24 +220,19 @@ def recompute_dataset(out_dir: str | Path, filter_style: bool = True) -> dict:
             "build_dataset that didn't cache OCR text. Run build_dataset again (the slow way, once) "
             "to populate it; recompute_dataset can reuse it from then on."
         )
+    if "spectrum_peak_amplitude" not in df.columns:
+        raise ValueError(
+            "spectrum_peak_amplitude column not found - these CSVs were written by an older version of "
+            "build_dataset (pre pixel-based Spectrum reading, or still using spectrum_fund_amp). "
+            "Run build_dataset again (the slow way, once) to populate it."
+        )
 
     has_text = df["chart_ocr_text"].notna() & (df["chart_ocr_text"].astype(str).str.strip() != "")
     n_recomputable = int(has_text.sum())
-
-    def _recompute_row(ocr_text: str) -> pd.Series:
-        style = classify_style_by_text(ocr_text)
-        hint = spectrum_priority_hint(ocr_text)
-        return pd.Series(
-            {
-                "style": style,
-                "spectrum_unit": hint["spectrum_unit"],
-                "spectrum_fund_amp": hint["spectrum_fund_amp"],
-                "spectrum_priority_hint": hint["spectrum_priority_hint"],
-            }
-        )
-
-    recomputed = df.loc[has_text, "chart_ocr_text"].apply(_recompute_row)
-    df.loc[has_text, recomputed.columns] = recomputed
+    df.loc[has_text, "style"] = df.loc[has_text, "chart_ocr_text"].apply(classify_style_by_text)
+    if "measurement_point" not in df.columns:
+        df["measurement_point"] = None
+    df.loc[has_text, "measurement_point"] = df.loc[has_text, "chart_ocr_text"].apply(detect_measurement_point)
 
     summary = _split_and_write(df, out_dir, filter_style)
     summary["rows_recomputed_from_cached_ocr"] = n_recomputable
