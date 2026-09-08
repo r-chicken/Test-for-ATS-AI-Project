@@ -101,6 +101,29 @@ MIN_RUN_HEIGHT_PX = 2       # below this, treat it as compression/antialiasing n
 MAX_PEEL_PASSES = 6         # how many stacked marker layers a single column can have peeled off it
 FULL_HEIGHT_TOL_PX = 2      # how close to literally touching both frame edges still counts as "spans it"
 
+# How much a pixel's channels may spread apart (max - min of R/G/B) and
+# still count as "frame border ink" in _find_plot_frame's dark-column scan.
+# The border/gridlines are genuinely neutral (black/gray, e.g. (0,0,0));
+# real trace ink is not, even when it also happens to read as "dark" by a
+# plain per-channel < 140 test - navy (0,0,128) has every channel under
+# 140 but a channel spread of 128. Needed because a genuine peak sitting
+# at a very low frequency (i.e. right next to the y-axis) can run almost
+# the full plot height in its own column, same as the border itself does -
+# without also requiring near-neutral color, that column's "dark fraction"
+# can outscore the border's actual 1px-wide black line and get PICKED as
+# the frame's left edge instead of it (confirmed on a real report: a
+# fund-amp peak at ~0.87 sitting one column right of the true border - the
+# border scored 0.575, the peak's own navy column scored 0.589 and won).
+# Once that happens, the left+2 margin meant to step past the border
+# instead steps past the peak itself, erasing it from the region before
+# ink-detection ever runs - the search then falls back to the tallest
+# peak that's left, which can be a much shorter one much further right.
+# This is very likely the mechanism behind "a thin peak reads as whatever
+# shorter/thicker peak is next in line" bug reports generally, not just
+# this one report - any genuine peak close enough to the axis to abut the
+# border column is equally at risk, regardless of how tall it is.
+FRAME_BORDER_MAX_CHANNEL_SPREAD = 40
+
 
 def detect_spectrum_unit(ocr_text: str) -> str:
     """Best-effort unit detection for the Spectrum plot, read from the
@@ -187,7 +210,7 @@ MEASUREMENT_POINT_RE = re.compile(r"\\\s*(?P<location>[^,\n]{2,60}?)\s*,")
 # while a genuine longer word that happened to start with H/V/A (lowercase
 # continuing right after) would fail this and correctly NOT be treated as
 # the end.
-_MEASUREMENT_POINT_CORE_RE = re.compile(r"[FM][a-z]*(?:\s+[A-Za-z]+)*?\s+[HVA](?=[^a-z]|$)")
+_MEASUREMENT_POINT_CORE_RE = re.compile(r"[FMP][a-z]*(?:\s+[A-Za-z]+)*?\s+[HVA](?=[^a-z]|$)")
 
 # Known OCR misreads worth correcting outright rather than leaving to the
 # repetition-voting below to (usually) outvote - confirmed on real reports:
@@ -204,14 +227,14 @@ _KNOWN_OCR_FIXES = [
 
 def detect_measurement_point(ocr_text: str) -> str | None:
     """Best-effort read of the sensor location/direction label from the
-    chart's own panel titles (e.g. "Mtr Shaft H", "Fan End H") - returns
-    None if nothing matched.
+    chart's own panel titles (e.g. "Mtr Shaft H", "Fan End H", "Pump
+    Shaft H") - returns None if nothing matched.
 
     The same label is printed redundantly under all three panels
     (Spectrum, Waterfall, Trend) on every real report seen, so rather than
     trusting whichever match comes first, this takes the most common
     string across all of them (after trimming each one down to its core
-    "{Fan|Mtr} ... {H|V|A}" span first - see _MEASUREMENT_POINT_CORE_RE -
+    "{Fan|Mtr|Pump} ... {H|V|A}" span first - see _MEASUREMENT_POINT_CORE_RE -
     so noise before/after that span doesn't split votes for what's really
     the same location across repeats within one image, not just across
     reports) - the same "let repetition outvote a one-off OCR slip" idea
@@ -269,40 +292,79 @@ def _read_y_axis_ticks(panel: Image.Image) -> tuple[list[tuple[float, float]], f
       edge and keeps only the largest cluster - reliably keeps the real
       ticks and drops the rest, even when a couple of them have very low
       OCR confidence (confidence alone was tried and wasn't reliable
-      enough to use as the primary filter here).
+      enough to use as the primary filter here). It's used as a tie-
+      breaker between same-size clusters, though - confirmed on a real
+      report where a rotated fault-frequency callout (a "Fund Amp: ..."
+      readout and a bearing-defect label, both printed in the plot's top-
+      left corner, right where the y-axis's own top tick labels are)
+      happened to right-align within the clustering tolerance of each
+      other AND tie the real tick cluster's size, so whichever cluster's
+      tokens Tesseract happened to emit first (scan order, not anything
+      meaningful) silently won - here, the annotation cluster, leaving
+      nothing usable to calibrate against. Every real tick label seen
+      across every report tested OCRs at 88+ confidence; every spurious
+      token from rotated/decorative annotation text seen OCRs at 0 - not
+      close enough to call reliable on its own (hence not the primary
+      filter), but a clean way to prefer the real cluster on an exact
+      count tie rather than leaving it to scan order.
+    - A single tick label can be missing from one psm pass entirely, or
+      have its digits garbled, while a DIFFERENT pass reads it cleanly -
+      confirmed on two real reports where Tesseract's default assumed-
+      layout mode (--psm 6, "one uniform block of text") merged/dropped a
+      label sitting close above or below another one (a "1" tick directly
+      under a "1.05" one; a "0.5" tick swallowed by a nearby callout's
+      dotted leader line), while --psm 6 misread a THIRD (a lone "0.2")
+      that --psm 6's own neighbor-relative digit model got dragged off by
+      an adjacent "92"-shaped fragment above it. --psm 11 ("sparse text,
+      no assumed layout") reads each of those correctly where 6 didn't -
+      but flips the failure the other way on a label 6 already had right
+      (misread "1.5" as "15", decimal dropped), so it's not a strict
+      upgrade to switch to on its own. Both passes run and their
+      candidates POOL into one list rather than one replacing the other -
+      safe to do because a wrong token from either pass (a stray "15", a
+      misread "99") almost never lands on the real calibration line, so
+      _ransac_calibration's existing outlier rejection (built to survive
+      exactly this kind of single bad token) discards it same as always;
+      meanwhile a label only one pass caught cleanly now has a chance to
+      make it into the kept set at all, instead of leaving a gap
+      _floor_to_axis_label has nothing to floor down to.
     """
     import pytesseract
 
     cw, ch = panel.size
     strip = panel.crop((0, 0, int(cw * Y_LABEL_STRIP_WFRAC), ch))
     strip_up = strip.resize((strip.size[0] * OCR_UPSCALE, strip.size[1] * OCR_UPSCALE), Image.LANCZOS)
-    data = pytesseract.image_to_data(
-        strip_up,
-        config="--psm 6 -c tessedit_char_whitelist=0123456789.",
-        output_type=pytesseract.Output.DICT,
-    )
 
     candidates = []
-    for i in range(len(data["text"])):
-        text = data["text"][i].strip()
-        if not text or not re.fullmatch(r"\d+\.\d+|\d+", text):
-            continue
-        row = (data["top"][i] + data["height"][i] / 2) / OCR_UPSCALE
-        right_edge = (data["left"][i] + data["width"][i]) / OCR_UPSCALE
-        candidates.append((row, float(text), right_edge))
+    for psm in (6, 11):
+        data = pytesseract.image_to_data(
+            strip_up,
+            config=f"--psm {psm} -c tessedit_char_whitelist=0123456789.",
+            output_type=pytesseract.Output.DICT,
+        )
+        for i in range(len(data["text"])):
+            text = data["text"][i].strip()
+            if not text or not re.fullmatch(r"\d+\.\d+|\d+", text):
+                continue
+            row = (data["top"][i] + data["height"][i] / 2) / OCR_UPSCALE
+            right_edge = (data["left"][i] + data["width"][i]) / OCR_UPSCALE
+            conf = float(data["conf"][i])
+            candidates.append((row, float(text), right_edge, conf))
 
     if not candidates:
         return [], None
 
     edges = np.array([c[2] for c in candidates])
-    best_center, best_count = edges[0], 0
+    confs = np.array([c[3] for c in candidates])
+    best_center, best_score = edges[0], (0, -1.0)
     for e in edges:
-        count = int(np.sum(np.abs(edges - e) <= 4))
-        if count > best_count:
-            best_count, best_center = count, e
+        mask = np.abs(edges - e) <= 4
+        score = (int(mask.sum()), float(confs[mask].sum()))
+        if score > best_score:
+            best_score, best_center = score, e
 
     points = sorted(
-        {(row, val) for row, val, edge in candidates if abs(edge - best_center) <= 4},
+        {(row, val) for row, val, edge, _conf in candidates if abs(edge - best_center) <= 4},
         key=lambda p: p[1],
     )
     return points, float(best_center)
@@ -361,13 +423,41 @@ def _find_plot_frame(arr: np.ndarray, label_right_edge: float, a: float, b: floa
     small triangle max-value marker, which tesseract failed to read even
     after upscaling) - the frame border pixel search recovers the exact
     row anyway.
+
+    Two different "dark" tests are used here, deliberately not the same
+    one, for the two different things being searched for:
+
+    - Finding the left/right border COLUMNS requires near-neutral color
+      (small max-min channel spread), not just each channel under 140 -
+      see FRAME_BORDER_MAX_CHANNEL_SPREAD for why a plain per-channel test
+      lets a genuine colored peak's own trace column outscore the border's
+      real (black) column and get picked as the left edge instead of it,
+      when that peak sits at a low enough frequency to run almost the
+      full plot height right next to the y-axis (confirmed on a real
+      report). Column detection needs this tightening because nothing
+      else dilutes a single peak's own column - it's either clearly the
+      border or clearly a peak.
+    - Finding the top/bottom border ROWS deliberately keeps the original
+      looser test (any channel-under-140 pixel, colored or not). The
+      bottom border row in particular is a case where TIGHTENING backfires:
+      confirmed on the same real report, that row is a horizontal line
+      that nearly every near-zero-amplitude frequency bin's own vertical
+      trace also touches (their baseline sits right on it), so requiring
+      neutral color there throws out most of the row's own dark pixels as
+      "trace-colored" and can make a same-colored coincidence elsewhere
+      look stronger than the real border - the loose test correctly
+      treats "was dark for some reason" as enough evidence for a
+      full-width horizontal line, where the column search cannot afford
+      to.
     """
     H, W = arr.shape[0], arr.shape[1]
     r, g, bch = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
     dark = (r < 140) & (g < 140) & (bch < 140)
+    channel_spread = np.maximum(np.maximum(r, g), bch) - np.minimum(np.minimum(r, g), bch)
+    dark_neutral = dark & (channel_spread < FRAME_BORDER_MAX_CHANNEL_SPREAD)
 
     lo, hi = int(label_right_edge), int(label_right_edge) + 40
-    col_frac = dark.mean(axis=0)
+    col_frac = dark_neutral.mean(axis=0)
     left = lo + int(np.argmax(col_frac[lo:hi]))
 
     lo2, hi2 = int(W * 0.85), int(W * 0.995)
@@ -453,20 +543,32 @@ def _find_peak_pixel(arr: np.ndarray, left: int, right: int, top: int, bottom: i
        same topmost ink row. A real spectral peak is one frequency wide,
        at most a couple of pixels - so any run of more than
        MAX_PLATEAU_WIDTH_PX columns at the same height is a block, not
-       data. Applies regardless of color - a genuine trace essentially
-       never forms a flat multi-column plateau (real spectral noise is
-       jagged), so this is safe to apply universally. A column inside a
-       detected block does NOT just get dropped, though - it gets peeled:
-       the block's own run in that column is skipped, and whatever ink
-       comes after it (below it) in that same column is looked at next,
-       same as for a tall thin mark below. This matters because a marker
-       can sit directly ON TOP of genuine data in the same column, not
-       just next to it - confirmed on a real report, a bar box + its
-       callout line hid a real peak that was over a full labeled gridline
-       taller than the peak this function used to report before that
-       column was ever looked at below the box. See MAX_PEEL_PASSES for
-       how many stacked layers one column can have peeled before giving up
-       on it.
+       data - EXCEPT a column that's already blue-dominant there
+       (_is_blue_ish, same test point 2 uses) is excluded from that count
+       and left alone entirely, not just exempted from the cap. Two real
+       reports needed this: a rotated harmonic-flag label box sitting
+       directly on top of a severe peak (the box's bottom edge touches the
+       peak's tip with no row gap, so without the exemption the peak's own
+       column reads as just more of the same plateau), and, separately, a
+       severe peak with no marker involved at all, whose own several
+       antialiased-width columns near its near-vertical rise were on their
+       own enough columns to exceed MAX_PLATEAU_WIDTH_PX. A plain "applies
+       regardless of color" version of this check (tried first) reads
+       either of those as a wide block and erases the peak along with it -
+       exactly backwards, same failure shape as the height cap in point 2
+       ignoring blue would have, and for the same reason: the taller and
+       more severe a real peak is, the more columns of its own width look
+       "flat" by this test. A column inside a detected block does NOT just
+       get dropped, though - it gets peeled: the block's own run in that
+       column is skipped, and whatever ink comes after it (below it) in
+       that same column is looked at next, same as for a tall thin mark
+       below. This matters because a marker can sit directly ON TOP of
+       genuine data in the same column, not just next to it - confirmed on
+       a real report, a bar box + its callout line hid a real peak that
+       was over a full labeled gridline taller than the peak this function
+       used to report before that column was ever looked at below the box.
+       See MAX_PEEL_PASSES for how many stacked layers one column can have
+       peeled before giving up on it.
     2. Tall thin marks that AREN'T richly-saturated blue - rotated
        marker-label text, a UI cursor/order-marker line (e.g. red, with a
        small square handle sitting right at/above the frame's top edge -
@@ -609,20 +711,50 @@ def _find_peak_pixel(arr: np.ndarray, left: int, right: int, top: int, bottom: i
             while c2 + 1 < W and topmost[c2 + 1] != H and abs(int(topmost[c2 + 1]) - int(topmost[c])) <= PLATEAU_ROW_TOL_PX:
                 c2 += 1
             if c2 - c + 1 > MAX_PLATEAU_WIDTH_PX:
-                any_wide = True
-                # Shared floor = just past the farthest this block's own
-                # (gap-merged) ink reaches, across every column in it -
-                # not just the shallowest one, so a stray deeper column
-                # doesn't leave the rest of the block only half-cleared.
-                block_end = 0
+                # A candidate plateau can accidentally rope in a genuine
+                # peak's own column(s) alongside real marker ink - not
+                # because the peak IS a marker, but because something
+                # shares its topmost row closely enough to read as the same
+                # plateau. Confirmed on two real reports: a harmonic-flag
+                # label box sitting directly on top of a severe peak (the
+                # box's bottom edge touches the peak's tip, no row gap
+                # between them), and, separately, a severe peak with no
+                # marker involved at all, whose own several antialiased-
+                # width columns near its near-vertical rise were enough
+                # columns on their own to exceed MAX_PLATEAU_WIDTH_PX.
+                # Either way the fix is the same: a column that's already
+                # blue-dominant (_is_blue_ish - the same test Stage 2 below
+                # uses to exempt a tall run from its own height cap) is
+                # real trace data, not marker ink, so it's excluded here
+                # too - both from the count that decides whether this is
+                # actually a wide block, and from the shared floor push,
+                # so its own ink is left completely alone for Stage 2 to
+                # read normally. Without this, the shared floor (next
+                # paragraph) gets computed from - and then applied to - a
+                # peak that was never part of the marker to begin with,
+                # which silently erases it.
+                marker_cols = []
                 for cc in range(c, c2 + 1):
                     idx = np.where(ink[:, cc])[0]
                     idx = idx[idx >= floor[cc]]
                     if len(idx) == 0:
                         continue
-                    block_end = max(block_end, int(_first_run(idx, cc)[-1]))
-                for cc in range(c, c2 + 1):
-                    floor[cc] = block_end + 1
+                    fr = _first_run(idx, cc)
+                    if _is_blue_ish(region[fr, cc]).mean() >= BLUE_ISH_MIN_FRAC:
+                        continue
+                    marker_cols.append((cc, int(fr[-1])))
+
+                if len(marker_cols) > MAX_PLATEAU_WIDTH_PX:
+                    any_wide = True
+                    # Shared floor = just past the farthest this block's own
+                    # (gap-merged) ink reaches, across every marker column in
+                    # it - not just the shallowest one, so a stray deeper
+                    # column doesn't leave the rest of the block only half-
+                    # cleared. Blue-dominant columns (excluded above) never
+                    # contribute to this, and never get it applied to them.
+                    block_end = max(end for _, end in marker_cols)
+                    for cc, _end in marker_cols:
+                        floor[cc] = block_end + 1
             c = c2 + 1
         if not any_wide:
             break
@@ -672,14 +804,68 @@ def _find_peak_pixel(arr: np.ndarray, left: int, right: int, top: int, bottom: i
     return y0 + int(resolved_topmost[best_col]), left + 2 + best_col
 
 
+def _infer_grid_ticks(values: set[float]) -> set[float]:
+    """Fill in gridline VALUES that sit strictly between two already-OCR'd
+    tick labels, when doing so is essentially certain rather than a guess.
+
+    Confirmed on two real reports: the axis had real, evenly-spaced
+    gridlines at a 0.5 step (0, 0.5, 1, 1.5...), but the "1" label sat
+    close enough beneath the auto-scaled top-of-axis label ("1.05") that
+    Tesseract couldn't read it at any --psm mode or upscale factor tried
+    (a single "1" glyph carries very little pixel information to begin
+    with) - so calibration only ever recovers 0, 0.5, and 1.05, leaving
+    _floor_to_axis_label nothing to floor a ~1.0 reading down to but 0.5,
+    even though the real "1" gridline is sitting right there on the chart,
+    unread rather than absent.
+
+    The fix doesn't try to OCR harder - it reasons from what's already
+    confirmed: these axes are evenly gridded, so the SMALLEST gap between
+    two already-RANSAC-confirmed real values is the axis's own grid step
+    (a smaller true step would mean two real gridlines closer together
+    than anything actually observed, which is a contradiction - two
+    confirmed points can't both be real and closer than the true step).
+    Every multiple of that step lying strictly between the lowest and
+    highest confirmed value is then a gridline that has to physically
+    exist on the chart whether or not its printed label survived OCR, so
+    it's added to the floor-candidate set. Nothing is ever extrapolated
+    PAST the confirmed range (that would be a real guess, not an
+    inference) - a step this fills gaps INSIDE, never projects outward
+    from. n_steps is capped as a guard against a degenerate near-zero gap
+    (e.g. two OCR reads of the same physical label a fraction of a pixel
+    apart) turning this into a very long, pointless loop; if that cap
+    trips, this returns the original values unchanged rather than a
+    partial fill.
+    """
+    vals = sorted(values)
+    if len(vals) < 2:
+        return set(vals)
+    gaps = [b - a for a, b in zip(vals, vals[1:]) if b - a > 1e-9]
+    if not gaps:
+        return set(vals)
+    step = min(gaps)
+    lo, hi = vals[0], vals[-1]
+    n_steps = int((hi - lo) / step + 1e-6)
+    if n_steps > 200:
+        return set(vals)
+    out = set(vals)
+    for i in range(n_steps + 1):
+        candidate = lo + i * step
+        if not any(abs(candidate - v) <= step * 0.1 for v in out):
+            out.add(round(candidate, 10))
+    return out
+
+
 def _floor_to_axis_label(value: float, kept_points: list[tuple[float, float]]) -> float:
     """Snap value down to the largest y-axis tick label at or below it -
     "read the peak, match it to the closest label rounded down" - rather
     than reporting a continuous interpolated number. This deliberately
     trades a little precision for staying anchored to a number that's
-    actually printed on the chart.
+    actually printed on the chart - see _infer_grid_ticks for the one
+    deliberate, narrow exception (a gridline value strictly between two
+    OCR'd labels, and therefore essentially certain to be real even
+    though Tesseract itself never read it).
     """
-    ticks = sorted({v for _, v in kept_points} | {0.0})
+    ticks = sorted(_infer_grid_ticks({v for _, v in kept_points} | {0.0}))
     floor_val = 0.0
     for t in ticks:
         if t <= value:
@@ -693,17 +879,44 @@ def read_spectrum_peak(chart_image: Image.Image) -> dict:
     """Read the Spectrum plot's tallest genuine peak off its own y-axis.
 
     Returns a dict with:
-      peak_amplitude       the peak, floored to the nearest y-axis label
-                            at or below it (float), or None if calibration
-                            or peak-finding failed
-      peak_amplitude_raw   the same reading before flooring (float or None) -
-                            kept for debugging/inspection, not used for
-                            priority thresholds
-      y_axis_ticks         the (value) labels used for calibration, for
-                            sanity-checking against the actual chart
-      error                None on success, else a short string saying
-                            what failed (e.g. "could not OCR enough y-axis
-                            tick labels to calibrate")
+      peak_amplitude         the peak's value (float, or None if
+                              calibration or peak-finding failed) - a
+                              continuous estimate from linearly
+                              interpolating the peak's pixel row against
+                              the calibrated y-axis (see below), NOT
+                              snapped to the nearest printed gridline
+      peak_amplitude_floored the same reading snapped down to the nearest
+                              y-axis label at or below it (float or None) -
+                              kept for cross-checking against a printed
+                              number on the chart by eye; not used for
+                              priority thresholds
+      y_axis_ticks            the (value) labels used for calibration, for
+                              sanity-checking against the actual chart - can
+                              include a value strictly between two OCR'd
+                              labels that Tesseract itself never read (see
+                              _infer_grid_ticks), not only literal OCR output
+      error                 None on success, else a short string saying
+                             what failed (e.g. "could not OCR enough y-axis
+                             tick labels to calibrate")
+
+    peak_amplitude used to be the floored reading, on the reasoning that
+    trading precision for staying anchored to a number actually printed on
+    the chart was worth it. Changed after a direct real-report comparison
+    (report_153: floored to 1.0, interpolated to 1.21, a person reading
+    the same chart by eye also independently said "about 1.2") - flooring
+    can only ever revise a reading DOWN, never up, so across many reports
+    it's a systematic downward bias on severity, not neutral rounding.
+    It also turned out to be quietly inconsistent with how this project's
+    own priority thresholds are fit: velocity_priority_hint and
+    acceleration_enveloping_priority_hint are refit against hand-eyeballed
+    chart readings (see their docstrings) - a person reading "about 1.2"
+    off a chart was never flooring to the nearest printed gridline either,
+    so scoring the automated reading against thresholds fit to that kind
+    of number, while itself floored, was comparing two different things.
+    _floor_to_axis_label / peak_amplitude_floored are kept, not deleted -
+    still useful for manually cross-checking a specific reading against
+    the chart's own printed numbers - just no longer what feeds
+    spectrum_priority_hint or gets used as priority thresholds are fit.
 
     Never raises - any failure (OCR found <2 usable tick labels, frame
     border not found, empty plot area, ...) comes back as
@@ -716,33 +929,33 @@ def read_spectrum_peak(chart_image: Image.Image) -> dict:
         panel = _crop_spectrum_panel(chart_image)
         points, label_right_edge = _read_y_axis_ticks(panel)
         if label_right_edge is None:
-            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": [], "error": "no y-axis tick labels OCR'd"}
+            return {"peak_amplitude": None, "peak_amplitude_floored": None, "y_axis_ticks": [], "error": "no y-axis tick labels OCR'd"}
 
         calibration = _ransac_calibration(points)
         if calibration is None:
-            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": [], "error": "could not calibrate y-axis (fewer than 2 consistent tick labels)"}
+            return {"peak_amplitude": None, "peak_amplitude_floored": None, "y_axis_ticks": [], "error": "could not calibrate y-axis (fewer than 2 consistent tick labels)"}
         a, b, kept = calibration
 
         arr = np.asarray(panel.convert("RGB")).astype(int)
         max_tick_val = max(v for _, v in kept)
         left, right, top, bottom = _find_plot_frame(arr, label_right_edge, a, b, max_tick_val)
         if right <= left + 4 or bottom <= top + 4:
-            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": sorted({v for _, v in kept}), "error": "plot frame border not found"}
+            return {"peak_amplitude": None, "peak_amplitude_floored": None, "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})), "error": "plot frame border not found"}
 
         peak_row, _peak_col = _find_peak_pixel(arr, left, right, top, bottom)
         if peak_row is None:
-            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": sorted({v for _, v in kept}), "error": "no data ink found in plot area"}
+            return {"peak_amplitude": None, "peak_amplitude_floored": None, "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})), "error": "no data ink found in plot area"}
 
         raw_value = (peak_row - b) / a
         floored = _floor_to_axis_label(raw_value, kept)
         return {
-            "peak_amplitude": floored,
-            "peak_amplitude_raw": raw_value,
-            "y_axis_ticks": sorted({v for _, v in kept}),
+            "peak_amplitude": round(raw_value, 4),
+            "peak_amplitude_floored": floored,
+            "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})),
             "error": None,
         }
     except Exception as exc:  # noqa: BLE001 - one bad image shouldn't kill a batch run
-        return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": [], "error": f"unexpected error: {exc}"}
+        return {"peak_amplitude": None, "peak_amplitude_floored": None, "y_axis_ticks": [], "error": f"unexpected error: {exc}"}
 
 
 # --- Priority thresholds per unit ---------------------------------------
@@ -824,22 +1037,158 @@ _UNIT_HINT_FNS = {
 }
 
 
-def spectrum_priority_hint(chart_image: Image.Image, ocr_text: str) -> dict:
+# --- Pump-specific priority thresholds ----------------------------------
+# Ported from ATS-Pumps-Project (see that repo's graph_signals.py for the
+# full derivation/data behind each number - not repeated here, just the
+# functions). Pump equipment's amplitude behavior genuinely differs from
+# fans' (per the project owner) - these are separate fitted thresholds
+# on pump-only data, not the fan ones above with different numbers typed
+# in, and must stay separate rather than merged into one "combined"
+# threshold set for both.
+
+
+def pump_velocity_priority_hint(amp: float) -> int:
+    """Velocity (in/s) peak amplitude -> priority, PUMP EQUIPMENT ONLY.
+    >1.44 -> 1, 0.344-1.44 -> 2, 0.113-0.344 -> 3, <0.113 -> 4. Refit
+    against 88 hand-eyeballed pump reports - see ATS-Pumps-Project's
+    graph_signals.py, velocity_priority_hint, for the full derivation."""
+    if amp > 1.44:
+        return 1
+    if amp >= 0.344:
+        return 2
+    if amp >= 0.113:
+        return 3
+    return 4
+
+
+def pump_acceleration_enveloping_priority_hint(amp: float) -> int:
+    """Acceleration enveloping (gE) peak amplitude -> priority, PUMP
+    EQUIPMENT ONLY. >1.28 -> 1, 0.179-1.28 -> 2, 0.048-0.179 -> 3,
+    <0.048 -> 4.
+
+    Given directly by the project owner, superseding an earlier port
+    from ATS-Pumps-Project that split this by Mtr vs. Pump measurement
+    location with different numbers - that split isn't used here."""
+    if amp > 1.28:
+        return 1
+    if amp >= 0.179:
+        return 2
+    if amp >= 0.048:
+        return 3
+    return 4
+
+
+def blower_velocity_priority_hint(amp: float) -> int:
+    """Velocity (in/s) peak amplitude -> priority, BLOWER EQUIPMENT ONLY.
+    >1.25 -> 1, 0.525-1.25 -> 2, 0.2875-0.525 -> 3, <0.2875 -> 4. Ported
+    from ATS-Blower-Project - fit against 338 of that project's own
+    blower reports (weighted-F1 grid search, same method as the pump/fan
+    fits elsewhere in this file); accuracy 72.5% vs. a 60.4% "always
+    guess Priority 4" baseline there. See ATS-Blower-Project's
+    graph_signals.py, velocity_priority_hint, for the full derivation -
+    including why blower thresholds are their own fit rather than reused
+    pump numbers."""
+    if amp > 1.25:
+        return 1
+    if amp >= 0.525:
+        return 2
+    if amp >= 0.2875:
+        return 3
+    return 4
+
+
+def blower_acceleration_enveloping_priority_hint(amp: float) -> int:
+    """Acceleration enveloping (gE) peak amplitude -> priority, BLOWER
+    EQUIPMENT ONLY. >0.925 -> 1, 0.275-0.925 -> 2, 0.17-0.275 -> 3,
+    <0.17 -> 4. Ported from ATS-Blower-Project - fit against 122 of that
+    project's own blower reports; accuracy 54.9% vs. a 49.2% baseline
+    there - a much weaker fit than velocity's (same conclusion the
+    pump/fan gE fits reached: severe real overlap between priorities at
+    the same gE amplitude, not a threshold-tuning problem). See
+    ATS-Blower-Project's graph_signals.py, acceleration_enveloping_
+    priority_hint, for the full derivation."""
+    if amp > 0.925:
+        return 1
+    if amp >= 0.275:
+        return 2
+    if amp >= 0.17:
+        return 3
+    return 4
+
+
+def classify_equipment_kind(equipment_id: str | None) -> str | None:
+    """Fan vs. pump vs. blower, straight off the equipment description
+    text extract.py parses out of the report (e.g. 'EF-3521 Exhaust
+    Fan', 'Fryer Hot Oil Pump', 'Transfer Belt Blower') - the word is
+    spelled out in that string on every report seen so far, so a plain
+    keyword check is simpler and more transparent than a learned
+    classifier for this one decision. Returns None when none of the
+    three appear, so the caller can flag it rather than guess which
+    threshold set applies."""
+    if not equipment_id:
+        return None
+    text = equipment_id.lower()
+    if "pump" in text:
+        return "pumps"
+    if "blower" in text:
+        return "blowers"
+    if "fan" in text:
+        return "fans"
+    return None
+
+
+def spectrum_priority_hint(chart_image: Image.Image, ocr_text: str, equipment_kind: str | None = None) -> dict:
     """Combine unit detection (OCR text) with the pixel-read Spectrum peak
     (read_spectrum_peak) into one supporting priority signal.
 
     Needs the chart IMAGE now, not just its OCR text - unlike the old Fund
     Amp version, the peak reading is pixel analysis, not a text field.
+
+    equipment_kind (see classify_equipment_kind) picks which threshold
+    set reads the amplitude - "pumps" and "blowers" each use their own
+    equipment-specific functions above, "fans" uses the original
+    fan-fitted ones via _UNIT_HINT_FNS. Anything else (None included -
+    couldn't tell which of the three it is) gets no priority hint at
+    all: no threshold set was fitted for it, and a wrong guess reads as
+    a real answer with nothing marking it as such - see process_pdf,
+    which still returns a spectrum reading either way (unit/amplitude),
+    just no priority_hint from it. Text-based scoring is a separate
+    decision the caller makes on its own (see streamlit_app/app.py) -
+    unlike these amplitude thresholds, the text classifier isn't
+    equipment-specific in the same way, so it isn't gated here.
     """
     unit = detect_spectrum_unit(ocr_text)
     peak = read_spectrum_peak(chart_image)
     amp = peak["peak_amplitude"]
-    hint_fn = _UNIT_HINT_FNS.get(unit)
-    priority_hint = hint_fn(amp) if (hint_fn is not None and amp is not None) else None
+    if amp is None:
+        priority_hint = None
+    elif equipment_kind == "pumps":
+        if unit == "in/s":
+            priority_hint = pump_velocity_priority_hint(amp)
+        elif unit == "gE":
+            priority_hint = pump_acceleration_enveloping_priority_hint(amp)
+        elif unit == "g":
+            priority_hint = acceleration_priority_hint(amp)  # unchanged for both kinds
+        else:
+            priority_hint = None
+    elif equipment_kind == "blowers":
+        if unit == "in/s":
+            priority_hint = blower_velocity_priority_hint(amp)
+        elif unit == "gE":
+            priority_hint = blower_acceleration_enveloping_priority_hint(amp)
+        elif unit == "g":
+            priority_hint = acceleration_priority_hint(amp)  # unchanged across all kinds
+        else:
+            priority_hint = None
+    elif equipment_kind == "fans":
+        hint_fn = _UNIT_HINT_FNS.get(unit)
+        priority_hint = hint_fn(amp) if hint_fn is not None else None
+    else:
+        priority_hint = None
     return {
         "spectrum_unit": unit,
         "spectrum_peak_amplitude": amp,
-        "spectrum_peak_amplitude_raw": peak["peak_amplitude_raw"],
+        "spectrum_peak_amplitude_floored": peak["peak_amplitude_floored"],
         "spectrum_priority_hint": priority_hint,
         "spectrum_peak_error": peak["error"],
     }
